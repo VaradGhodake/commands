@@ -1,0 +1,2378 @@
+#!/usr/bin/python3
+
+# Smart frontend to "ps".
+#
+# Features:
+# - Simple & sane command-line options.  (OS default "ps" options are
+#   bewildering.  Linux "ps" tries to emulate two dozen different OSes with
+#   different options implicitly setting hidden "personality" settings that
+#   cause subtle differences in other options.  Examples: "ps auxf" and "ps
+#   -efH" do similar things but "ps aux" and "ps -aux" are different;
+#   heuristics are used to determine whether "O" means sort or format.)
+# - Powerful filtering.  Better than 'ps | grep ...' because:
+#     - Shows header while filtering
+#     - Colorizes
+#     - Arbitrary boolean expressions
+#     - Advanced filter columns (e.g. %CPU#<=10 means filter by top 10 CPU
+#       users)
+#     - Can show & filter virtual columns (e.g. EXECUTABLE)
+#     - Can filter by hidden columns (e.g. filter by executable name but show
+#       only pid => better pgrep)
+#     - Doesn't clutter output with ps or grep process
+# - Consistent output format across OSes
+# - Consistent command-line interface across OSes
+# - Tree/forest view (like in Linux ps)
+# - Full command line (under Solaris, only when sps is available)
+
+# TODO: Show the program name in a different color than path and arguments.
+# Somehow show both EXECUTABLE and COMMAND columns together without
+# duplicating information.
+
+from __future__ import (absolute_import, division, print_function,
+                        with_statement)
+
+import os
+import sys
+
+# Optimization: xps is fully self-contained and doesn't need any secondary
+# modules from the parent directory.  Remove the parent directory from
+# sys.path.  (Python adds this by default for all scripts.)  This makes a
+# difference when the xps script lives in an NFS directory.
+if sys.path[0] == '' or sys.path[0] == os.path.dirname(sys.argv[0]):
+    del sys.path[0]
+
+# Remove current directory from sys.path.
+if (sys.path[0] == os.getcwd() and
+    not sys.path[0].startswith(sys.prefix) and
+    not (getattr(sys, 'real_prefix', None) and
+         sys.prefix[0].startswith(sys.real_prefix))):
+    del sys.path[0]
+
+import array
+import errno
+from   functools                import reduce
+import itertools
+import logging
+import operator
+import optparse
+import os
+import pwd
+import re
+import subprocess
+import sys
+
+if hasattr(sys, "intern"): intern = sys.intern # py3
+
+######################################################################
+# Below parser code is based on funcparserlib:
+# Copyright (c) 2008/2009 Andrey Vlasovskikh
+#
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+#
+# The above copyright notice and this permission notice shall be included
+# in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+# IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+# CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+# TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+def pos_to_str(pos):
+    '((int, int), (int, int)) -> str'
+    start, end = pos
+    sl, sp = start
+    el, ep = end
+    return '%d,%d-%d,%d' % (sl, sp, el, ep)
+
+class SyntaxError(Exception):
+    'The base class for funcparserlib errors.'
+    def __init__(self, msg, pos=None):
+        Exception.__init__(self, msg, pos)
+
+    @property
+    def pos(self):
+        'SyntaxError -> ((int, int), (int, int)) or None'
+        return self.args[1]
+
+    def __unicode__(self):
+        pos = self.args[1]
+        s = u'%s: ' % pos_to_str(pos) if pos is not None else ''
+        return u'%s%s' % (s, self.args[0])
+
+    def __str__(self):
+        return unicode(self).encode()
+
+
+class LexerError(SyntaxError):
+    def __init__(self, msg, pos):
+        SyntaxError.__init__(self, u'cannot tokenize data: "%s"' % msg, pos)
+
+
+class Token(object):
+    def __init__(self, type, value, pos=None, m=None):
+        self.type = type
+        self.value = value
+        self.pos = pos
+        self.m = m
+
+    def __repr__(self):
+        return 'Token(%r, %r)' % (self.type, self.value)
+
+    def __eq__(self, other):
+        return (self.type == other.type
+            and self.value == other.value)
+
+    def __unicode__(self):
+        s = u"%s '%s'" % (self.type, self.value)
+        return s.strip()
+
+    def __str__(self):
+        return unicode(self).encode()
+
+    def pformat(self):
+        return u"%s %s '%s'" % (pos_to_str(self.pos).ljust(20),
+            self.type.ljust(14), self.value)
+
+    @property
+    def name(self):
+        return self.value
+
+class Spec(object):
+    def __init__(self, type, regexp, flags=0):
+        self.type = type
+        self._regexp = regexp
+        self._flags = flags
+        self.re = re.compile(regexp, flags)
+
+    def __repr__(self):
+        return 'Spec(%r, %r, %r)' % (self.type, self._regexp, self._flags)
+
+def make_tokenizer(specs):
+    '[Spec] -> (str -> Iterable(Token))'
+    def match_specs(specs, str, i, linepos):
+        (line, pos) = linepos
+        for spec in specs:
+            m = spec.re.match(str, i)
+            if m is not None:
+                value = m.group()
+                nls = value.count(u'\n')
+                n_line = line + nls
+                if nls == 0:
+                    n_pos = pos + len(value)
+                else:
+                    n_pos = len(value) - value.rfind(u'\n') - 1
+                return Token(spec.type, value, ((line, pos), (n_line, n_pos)), m)
+        else:
+            errline = str.splitlines()[line - 1]
+            raise LexerError(errline, ((line, pos), (line, len(errline))))
+    def f(str):
+        length = len(str)
+        line, pos = 1, 0
+        i = 0
+        while i < length:
+            t = match_specs(specs, str, i, (line, pos))
+            yield t
+            _, end = t.pos
+            line, pos = end
+            i = i + len(t.value)
+    return f
+
+class Parser(object):
+    def __init__(self, p):
+        self.define(p)
+
+    def named(self, name):
+        self.name = name
+        return self
+
+    def define(self, p):
+        f = getattr(p, 'run', p)
+        self.run = f
+        self.named(getattr(p, 'name', p.__doc__))
+        self.always_succeeds = False
+
+    def parse(self, tokens):
+        try:
+            (tree, _) = self.run(tokens, State())
+            return tree
+        except NoParseError as e:
+            max = e.state.max
+            tok = tokens[max] if max < len(tokens) else '<EOF>'
+            raise ParserError(u'%s: %s' % (e.msg, tok),
+                getattr(tok, 'pos', None))
+
+    def __add__(self, other):
+        def magic(v1, v2):
+            vs = [v for v in [v1, v2] if not isinstance(v, _Ignored)]
+            if len(vs) == 1:
+                return vs[0]
+            elif len(vs) == 2:
+                if isinstance(vs[0], _Tuple):
+                    return _Tuple(v1 + (v2,))
+                else:
+                    return _Tuple(vs)
+            else:
+                return _Ignored(())
+        @Parser
+        def _add(tokens, s):
+            (v1, s2) = self.run(tokens, s)
+            (v2, s3) = other.run(tokens, s2)
+            return (magic(v1, v2), s3)
+        _add.name = '(%s , %s)' % (self.name, other.name)
+        _add.always_succeeds = self.always_succeeds and other.always_succeeds
+        return _add
+
+    def __or__(self, other):
+        @Parser
+        def _or(tokens, s):
+            try:
+                return self.run(tokens, s)
+            except NoParseError as e:
+                return other.run(tokens, State(s.pos, e.state.max))
+        _or.name = '(%s | %s)' % (self.name, other.name)
+        _or.always_succeeds = self.always_succeeds or other.always_succeeds
+        return _or
+
+    def __rshift__(self, f):
+        @Parser
+        def _shift(tokens, s):
+            (v, s2) = self.run(tokens, s)
+            return (f(v), s2)
+        _shift.name = self.name
+        _shift.always_succeeds = self.always_succeeds
+        return _shift
+
+    def bind(self, f):
+        @Parser
+        def _bind(tokens, s):
+            (v, s2) = self.run(tokens, s)
+            return f(v).run(tokens, s2)
+        _bind.name = '(%s >>=)' % self.name
+        _bind.always_succeeds = self.always_succeeds
+        return _bind
+
+class State(object):
+    def __init__(self, pos=0, max=0):
+        self.pos = pos
+        self.max = max
+
+    def __unicode__(self):
+        return unicode((self.pos, self.max))
+
+    def __repr__(self):
+        return 'State(%r, %r)' % (self.pos, self.max)
+
+class ParserError(SyntaxError):
+    'User-visible parsing error.'
+    pass
+
+class GrammarError(Exception):
+    'Raised when the grammar definition itself contains errors.'
+    pass
+
+class NoParseError(Exception):
+    def __init__(self, msg='', state=None):
+        self.msg = msg
+        self.state = state
+
+    def __unicode__(self):
+        return self.msg
+
+    def __str__(self):
+        return self.msg.encode()
+
+class _Tuple(tuple): pass
+
+class _Ignored(object):
+    def __init__(self, value):
+        self.value = value
+
+    def __repr__(self):
+        return '_Ignored(%s)' % repr(self.value)
+
+@Parser
+def finished(tokens, s):
+    if s.pos >= len(tokens):
+        return (None, s)
+    else:
+        raise NoParseError('should have reached <EOF>', s)
+finished.name = 'finished'
+
+def many(p):
+    @Parser
+    def _many(tokens, s):
+        'Iterative implementation preventing the stack overflow.'
+        res = []
+        try:
+            while True:
+                (v, s) = p.run(tokens, s)
+                res.append(v)
+        except NoParseError as e:
+            return (res, e.state)
+    _many.name = '{ %s }' % p.name
+    _many.always_succeeds = True
+    if p.always_succeeds:
+        raise GrammarError('parser %s does not halt, please fix your grammar. '
+            'see FAQ for details' % _many.name)
+    return _many
+
+def some(pred):
+    @Parser
+    def _some(tokens, s):
+        if s.pos >= len(tokens):
+            raise NoParseError('no tokens left in the stream', s)
+        else:
+            t = tokens[s.pos]
+            if pred(t):
+                pos = s.pos + 1
+                s2 = State(pos, max(pos, s.max))
+                return (t, s2)
+            else:
+                raise NoParseError('got unexpected token', s)
+    _some.name = '(some)'
+    return _some
+
+def a(value):
+    name = getattr(value, 'name', value)
+    return some(lambda t: t == value).named('(a "%s")' % name)
+
+def skip(p):
+    return p >> _Ignored
+
+def with_forward_decls(suspension):
+    @Parser
+    def f(tokens, s):
+        return suspension().run(tokens, s)
+    return f
+
+# end funcparserlib
+######################################################################
+
+uname = intern(os.uname()[0])
+if uname.endswith("BSD"): uname = "BSD"
+
+AUTOMATIC = object()
+
+def memoize(f):
+    mem = {}
+    def wrapped(*args, **kwargs):
+        mem_key = (args, tuple(kwargs.items()))
+        try:
+            return mem[mem_key]
+        except KeyError:
+            result = f(*args, **kwargs)
+            mem[mem_key] = result
+            return result
+    return wrapped
+
+
+class cached_attribute(object):
+
+    def __init__(self, method, name=None):
+        self.method = method
+        self.name = name or method.__name__
+
+    def __get__(self, inst, cls):
+        if inst is None:
+            return self
+        result = self.method(inst)
+        setattr(inst, self.name, result)
+        return result
+
+
+def remove_suffix(string, suffix):
+    if string.endswith(suffix):
+        return string[:-len(suffix)]
+    else:
+        return string
+
+def negfloat(s): return -float(s)
+def negint(s): return -int(s)
+def padnums(s):
+    def repl(s):
+        return "%020.8f" % float(s.group(0))
+    return re.sub("[0-9]+(?:[.][0-9]*)?", repl, str(s))
+
+
+class InvalidColumnError(Exception):
+    pass
+
+class Column(object):
+
+    def __new__(cls, arg):
+        if isinstance(arg, cls):
+            return arg
+        elif isinstance(arg, str):
+            return cls._from_name(arg)
+        else:
+            raise TypeError
+
+    @classmethod
+    def _construct(cls, name, index, rjust):
+        self = object.__new__(cls)
+        self.name  = name
+        self.uname = name.upper()
+        self.index = index
+        self.rjust = rjust
+        return self
+
+    @classmethod
+    def _init_cls(cls, names, aliases, virtual_columns, rjust_columns):
+        assert not hasattr(cls, "_BY_NAME")
+        by_name = {}
+        rjust_columns = set(rjust_columns)
+        for i, name in enumerate(names):
+            by_name[name    ] = cls._construct(name    , i, name in rjust_columns)
+            by_name[name+"#"] = cls._construct(name+"#", i, False)
+        for name, target_column_name in aliases.items():
+            by_name[name    ] = by_name[target_column_name    ]
+            by_name[name+"#"] = by_name[target_column_name+"#"]
+        cls._BY_NAME = by_name
+        cls._VIRTUAL_COLUMNS = dict(
+            (by_name[k], by_name[v]) for k,v in virtual_columns.items())
+
+
+    @classmethod
+    def _from_name(cls, name):
+        name = name.lower()
+        try:
+            return cls._BY_NAME[name]
+        except KeyError:
+            raise InvalidColumnError("Invalid column '%s'" % name.upper())
+
+    @cached_attribute
+    def raw_name(self):
+        return remove_suffix(self.name, '#')
+
+    @property
+    def physical_column(self):
+        column = Column(self.raw_name) # usually column = self
+        return self._VIRTUAL_COLUMNS.get(column, column)
+
+    @cached_attribute
+    def sort_value(self):
+        if self.name.endswith("#"):
+            return int
+        return {
+            'pid' : int     ,
+            'ppid': int     ,
+            'pgid': int     ,
+            'tid' : int     ,
+            'sid' : int     ,
+            'nice': negint  ,
+            'rss' : negint  ,
+            'vsz' : negint  ,
+            '%cpu': negfloat,
+            '%mem': negfloat,
+            'time': negint  ,
+            'time': negint  ,
+            'tty' : padnums ,
+        }.get(self.name, str)
+
+    @cached_attribute
+    def _cmpkey(self):
+        return (self.index, self.name)
+
+    def __cmp__(self, o):
+        return cmp(self._cmpkey, o._cmpkey)
+
+    def __eq__(self, o):
+        return self._cmpkey == o._cmpkey
+
+    def __lt__(self, o):
+        return self._cmpkey < o._cmpkey
+
+    def __gt__(self, o):
+        return self._cmpkey > o._cmpkey
+
+    def __le__(self, o):
+        return self._cmpkey <= o._cmpkey
+
+    def __ge__(self, o):
+        return self._cmpkey >= o._cmpkey
+
+    def __hash__(self):
+        return hash(self.name)
+
+    def __repr__(self):
+        return "Column(%r)" % (self.uname)
+
+    def __str__(self):
+        return self.uname
+
+
+Column._init_cls(
+    [
+        'uid',
+        'gid',
+        'user',
+        'pid',
+        'tid',
+        'ppid',
+        'pgid',
+        'sid',
+        'children',
+        'descendants',
+        'ancestors',
+        'pri',
+        'nice',
+        'tty',
+        's',
+        'wchan',
+        'start',
+        'time',
+        'elapsed',
+        'rss',
+        'vsz',
+        '%cpu',
+        '%mem',
+        'executable',
+        'command0',
+        'command',
+    ],
+
+    aliases={
+        'priority':'pri',
+        'prio'    :'pri',
+        'tt'      :'tty',
+        'stime'   :'start',
+        'etime'   :'elapsed',
+        'pcpu'    :'%cpu',
+        'pmem'    :'%mem',
+        'cpu'     :'%cpu',
+        'mem'     :'%mem',
+        'args'    :'command',
+        'comm'    :'command',
+        'cmd'     :'command',
+        'exec'    :'executable',
+        'exe'     :'executable',
+        'state'   :'s',
+        'lwp'     :'tid',
+        'spid'    :'tid',
+    },
+
+    virtual_columns={
+        'executable' : 'command',
+        'command0'   : 'command',
+        'children'   : 'ppid'   ,
+        'descendants': 'ppid'   ,
+        'ancestors'  : 'ppid'   ,
+    },
+
+    rjust_columns=['pid', 'tid', 'ppid', 'pgid', 'sid', 'nice',
+                   'rss', 'vsz', '%cpu', '%mem', 'time', 'elapsed'],
+
+)
+
+
+def is_int(x):
+    try:
+        int(x)
+        return True
+    except ValueError:
+        return False
+
+DEFAULT_COLUMNS = [
+    Column('user'   ),
+    Column('pid'    ),
+    Column('tty'    ),
+    Column('%cpu'   ),
+    Column('%mem'   ),
+    Column('command'),
+    ]
+
+VERBOSE_COLUMNS = [
+    Column('s'    ),
+    Column('start'),
+    Column('time' ),
+    Column('rss'  ),
+    Column('vsz'  ),
+    ]
+
+TEXT_SEARCH_COLUMNS = [
+    Column('user'   ),
+    Column('command'),
+    Column('tty'    ),
+    ]
+
+# Defines how each OS/etc names columns
+COLUMN_PS_NAMES_MAP = {
+    'Linux': {
+        Column('user'   ): 'user:32' ,
+        Column('command'): 'args'    ,
+        Column('start'  ): 'stime'   ,
+        Column('%cpu'   ): 'pcpu'    ,
+        Column('%mem'   ): 'pmem'    ,
+        Column('tid'    ): 'lwp'     ,
+        Column('elapsed'): 'etime'   ,
+        Column('wchan'  ): 'wchan:40',
+    },
+
+    'SunOS': {
+        Column('command'): 'args' ,
+        Column('start'  ): 'stime',
+        Column('%cpu'   ): 'pcpu' ,
+        Column('%mem'   ): 'pmem' ,
+        Column('elapsed'): 'etime',
+    },
+
+    'BSD': {
+        Column('start'  ): 'stime',
+        Column('%cpu'   ): 'pcpu' ,
+        Column('%mem'   ): 'pmem' ,
+        Column('elapsed'): 'etime',
+    },
+
+    'Darwin': {
+        Column('start'  ): 'stime',
+        Column('%cpu'   ): 'pcpu' ,
+        Column('%mem'   ): 'pmem' ,
+        Column('elapsed'): 'etime',
+        Column('s'      ): 'state',
+    },
+
+}[uname]
+
+
+PCPU_SCALE_OS_DEFAULT = {
+    'Linux': 'per_cpu',
+    'SunOS': 'per_machine',
+    'Darwin': 'per_cpu',
+    }
+
+def format_column_args(columns):
+    args = []
+    pcolumns = [Column(c).physical_column for c in columns]
+    # Make sure that we don't include a physical column more than once, which
+    # can cause problems for the 'COMMAND' column.
+    pcolumns = set(pcolumns)
+    for column in sorted(pcolumns):
+        args.append('-o')
+        ps_name = COLUMN_PS_NAMES_MAP.get(column, column.name)
+        args.append("%s=%s" % (ps_name, "_%s_" % column.name))
+    return args
+
+
+def comma_split_list(args):
+    r = []
+    for arg in args:
+        r.extend([item for item in arg.split(',') if item])
+    return r
+
+def parse_column_header(col):
+    if not col.startswith('_') or not col.endswith('_'):
+        raise Exception("bad column header %r" % col)
+    return col[1:-1]
+
+def justify(column, value, width):
+    if column.rjust:
+        return value.rjust(width)
+    else:
+        return value.ljust(width)
+
+def colorize(str, color_vector):
+    r = []
+    cur_color = False
+    for char, color in zip(str, color_vector):
+        if color != cur_color:
+            if color: r.append("\033[31m")
+            else:     r.append("\033[0m")
+            cur_color = color
+        r.append(char)
+    if cur_color:
+        r.append("\033[0m")
+    return ''.join(r)
+
+def get_winsz_columns():
+    try:
+        import fcntl, struct, termios
+        rows, cols = struct.unpack('hh', fcntl.ioctl(1, termios.TIOCGWINSZ, '1234'))
+        return cols or 0
+    except Exception:
+        return 0
+
+
+@memoize
+def get_virtual_cpu_count():
+    if uname == 'Linux':
+        with open("/proc/cpuinfo") as f:
+            result = sum(1 for line in f if 'processor' in line)
+    elif uname == 'SunOS':
+        psrinfo = subprocess.Popen(['/usr/sbin/psrinfo'], stdout=subprocess.PIPE).communicate()[0]
+        result = len(psrinfo.splitlines())
+    elif uname == 'Darwin':
+        d = subprocess.Popen(['/usr/sbin/sysctl', '-n', 'hw.logicalcpu_max'], stdout=subprocess.PIPE).communicate()[0]
+        result = int(d.split())
+    else:
+        raise NotImplementedError(
+            "Don't know how to count virtual CPUs on %s" % (uname,))
+    if not result >= 1:
+        raise Exception("get_virtual_cpu_count() got insane %d CPUs" % (result,))
+    return result
+
+
+@memoize
+def get_tty_name():
+    if not os.isatty(0):
+        return None
+    if os.uname()[0] == 'Linux':
+        tty = os.readlink("/proc/self/fd/0")
+        if tty.startswith("/dev/pts"):
+            return tty
+        else:
+            return None
+    else:
+        proc = subprocess.Popen(['tty'], stdout=subprocess.PIPE)
+        tty = proc.communicate()[0].strip()
+        if proc.returncode or not tty or 'not ' in tty:
+            return None
+        return tty
+
+
+def remove_tty_dev_prefix(s):
+    if s.startswith("/dev/"):
+        return s[5:]
+    else:
+        return s
+
+
+@memoize
+def get_user_name():
+    return pwd.getpwuid(os.getuid()).pw_name
+
+
+def move_to_front_of_list(list, item):
+    '''
+    Mutate C{list} in-place, moving C{item} to the front.  C{item} must be a
+    member of C{list}.
+
+      >>> l = ['abc', 'def', 'ghi']
+      >>> move_to_front_of_list(l, 'ghi')
+      ['ghi', 'abc', 'def']
+
+    @return:
+      mutated C{list}
+    '''
+    old_pos = list.index(item)
+    if old_pos == -1:
+        raise ValueError("%r is not in list" % item)
+    if old_pos == 0:
+        return list
+    del list[old_pos]
+    list.insert(0, item)
+    return list
+
+
+getpid = memoize(os.getpid)
+getppid = memoize(os.getppid)
+
+if hasattr(array.array('b'), "tobytes"): # py3
+    array2bytes = lambda array: array.tobytes()
+else:
+    array2bytes = lambda array: array.tostring()
+
+
+class MatchedStr(object):
+    '''A string that keeps track of matched regexp searches.'''
+
+    __slots__ = ['_str', '_link', '_matched']
+
+    def __init__(self, s, _matched=None, link=None):
+        self._str = str(s)
+        self._link = link
+        self._matched = _matched or getattr(s, "_matched", None)
+        if self._matched:
+            assert len(self._matched) == len(self._str)
+
+    @property
+    def matched(self):
+        return self._matched and any(self._matched)
+
+    @staticmethod
+    def _s_storematch(str, matched, regexp, store=True):
+        '''Search string for C{regexp}.
+        Remember which characters have been matched.
+        Returns number of matches.
+        '''
+        if regexp == '.' or regexp.pattern == '.': # Optimization
+            l = len(str)
+            if store:
+                matched[:] = array.array('b', b'\1' * l)
+            return l
+
+        matches = 0
+        for match in regexp.finditer(str):
+            if store:
+                for i in range(*match.span(0)):
+                    matched[i] = True
+            matches += 1
+        return matches
+
+    def storematch(self, regexp, store=True):
+        if self._matched is None:
+            self._matched = array.array('b', b'\0'*len(self._str))
+        b = self._s_storematch(self._str, self._matched, regexp, store=store)
+        if b and store and self._link:
+            self._link.storematch(regexp, store=True)
+        return b
+
+    def __str__(self):
+        return self._str
+
+    def __len__(self):
+        return len(self._str)
+
+    def colored(self, color):
+        if color and self._matched:
+            return colorize(self._str, self._matched)
+        else:
+            return self._str
+
+    def __float__(self):
+        try:
+            return float(self._str)
+        except ValueError:
+            return 0.0
+
+    def __int__(self):
+        try:
+            return int(self._str)
+        except ValueError:
+            return int(float(self))
+
+    def __hash__(self):
+        return hash(self._str)
+
+    def __eq__(self, other):
+        return str(self) == str(other)
+
+    def __add__(self, other):
+        if not len(other):
+            return self
+        if not len(self):
+            if hasattr(other, '_matched'):
+                return other
+            else:
+                return MatchedStr(other)
+        omatched = getattr(other, '_matched', None)
+        if self._matched or omatched:
+            smatched = self._matched or array.array('b', b'\0'*len(self._str))
+            omatched = omatched or array.array('b', b'\0'*len(other))
+            jmatched = smatched + omatched
+        else:
+            jmatched = None
+        return MatchedStr(self._str + str(other), jmatched)
+
+    def __radd__(self, other):
+        if not len(other):
+            return self
+        if not len(self):
+            if hasattr(other, '_matched'):
+                return other
+            else:
+                return MatchedStr(other)
+        omatched = getattr(other, '_matched', None)
+        if self._matched or omatched:
+            smatched = self._matched or array.array('b', b'\0'*len(self._str))
+            omatched = omatched or array.array('b', b'\0'*len(other))
+            jmatched = omatched + smatched
+        else:
+            jmatched = None
+        return MatchedStr(str(other) + self._str, jmatched)
+
+    def __iadd__(self, other):
+        self._str += str(other)
+        omatched = getattr(other, '_matched', None)
+        if self._matched or omatched:
+            if self._matched is None:
+                self._matched = array('b', '\0'*len(self._str))
+            omatched = omatched or array.array('b', b'\0'*len(other))
+            self._matched.extend(omatched)
+        return self
+
+    def __getitem__(self, slc):
+        assert isinstance(slc, slice)
+        s = self._str[slc]
+        if s == self._str:
+            return self
+        m = None if self._matched is None else self._matched[slc]
+        return MatchedStr(s, m)
+
+    def ljust(self, n):
+        return self + ' '*(n - len(self._str))
+
+    def rjust(self, n):
+        return ' '*(n - len(self._str)) + self
+
+    def rstrip(self):
+        s = self._str.rstrip()
+        if s == self._str:
+            return self
+        m = None if self._matched is None else self._matched[:len(s)]
+        return MatchedStr(s, m)
+
+    def join(self, items):
+        if not len(items):
+            return MatchedStr("")
+        if len(items) == 1:
+            return items[0]
+        strs = [str(s) for s in items]
+        jstrs = self._str.join(strs)
+        if self._matched or any(s._matched for s in items):
+            m = array2bytes(self._matched) if self._matched else b'\0'*len(self._str)
+            matches = [array2bytes(s._matched) if s._matched else b'\0'*len(s._str)
+                       for s in items]
+            jmatched = array.array('b', m.join(matches))
+        else:
+            jmatched = None
+        return MatchedStr(jstrs, _matched=jmatched)
+
+    @property
+    def mstr(self):
+        return self
+
+class MatchedStrSlice(object):
+    """Represents a dynamic slice of a MatchedStr, with transparent updates
+    for storematch."""
+    def __init__(self, ms, slice):
+        self._slice = slice
+        self._ms = ms
+
+    def storematch(self, regexp, store=True):
+        if self._ms._matched is None:
+            self._ms._matched = array('b', '\0'*len(self._ms._str))
+        matched = self._ms._matched[self._slice]
+        matches = self._ms._s_storematch(self._ms._str[self._slice], matched, regexp, store=store)
+        if store:
+            self._ms._matched[self._slice] = matched
+        return matches
+
+    def _sliceval(self):
+        # Returns a normal MatchedStr object without transparent updates
+        return self._ms[self._slice]
+
+    def __getattr__(self, k):
+        return getattr(self._sliceval(), k)
+
+    def __len__(self):
+        return len(self._sliceval())
+
+
+class MatchedStrList(object):
+    """
+    Represents a list of MatchedStrs.
+    """
+    def __init__(self, mstrs, copy=False):
+        if copy:
+            # Create new MatchedStr instances, without keeping color.
+            mstrs = [MatchedStr(str(x)) for x in mstrs]
+        self.mstrs = list(mstrs)
+
+    @property
+    def mstr(self):
+        """
+        Return a single L{MatchedStr} concatenated by spaces.
+        """
+        return MatchedStr(' ').join(self.mstrs)
+
+
+class PsLine(object):
+    '''A line of `ps` output.  Columns are accessible as attributes,
+    e.g. psline.pid'''
+    def __init__(self, line, columns):
+        self._line = line
+        # 'command' column is the only one that's allowed to contain spaces,
+        # and the only one that's allowed to be missing, and it's always last
+        # if it's there.
+        linesplit = line.split(None, len(columns)-1)
+        assert len(linesplit) <= len(columns)
+        if len(linesplit) == len(columns):
+            pass
+        elif len(linesplit) == len(columns) - 1 and columns[-1].name=='command':
+            # command could be empty
+            linesplit.append("")
+        else:
+            raise ValueError(
+                "Got line %r with %d columns, but expected %d columns (%s)"
+                % (line, len(linesplit), len(columns), ' '.join(c.name for c in columns)))
+        self.__dict__.update(
+            zip([c.name for c in columns], [MatchedStr(s) for s in linesplit]))
+        self.parent = None
+        self._children = []
+
+    def __getattr__(self, name):
+        try:
+            name = Column(name).name
+        except InvalidColumnError:
+            pass
+        return object.__getattribute__(self, name)
+
+    def __setattr__(self, name, value):
+        try:
+            name = Column(name).name
+        except InvalidColumnError:
+            pass
+        object.__setattr__(self, name, value)
+
+    def __getitem__(self, column):
+        column = Column(column)
+        return getattr(self, column.name)
+
+    def __setitem__(self, column, value):
+        column = Column(column)
+        setattr(self, column.name, value)
+
+    def __str__(self):
+        return self._line
+
+    def __repr__(self):
+        return "<PsLine %r>" % (self._line)
+
+    @cached_attribute
+    def command0(self):
+        # Match the first word of COMMAND.  Skip initial '-' (that means login
+        # shell).  In addition to ' ', also stop at ':' since that's typically
+        # the result of a daemon modifying argv0 to display some extra info.
+        m = re.match("-?([^: ]*)", self.command._str)
+        assert m # regexp should match any string
+        slc = slice(*m.span(1))
+        return MatchedStrSlice(self.command, slc)
+
+    @cached_attribute
+    def executable(self):
+        execlink = None
+        if uname == 'Linux':
+            execlink = "/proc/%d/exe" % (self.pid)
+        elif uname == 'SunOS':
+            execlink = "/proc/%d/path/a.out" % (self.pid)
+        if execlink:
+            # On Linux, a /proc/$pid/exe can be unreadable by non-root if the
+            # process is unptraceable - e.g. ssh-agent does
+            # prctl(PR_SET_DUMPABLE, ...).
+            try:
+                return MatchedStr(os.readlink(execlink))
+            except OSError:
+                pass
+        return MatchedStr("<%s>" % (self.command0._str,))
+
+    @cached_attribute
+    def _descendants(self):
+        q = [self]
+        r = []
+        while q:
+            item = q.pop(0)
+            r.append(item)
+            for child in item._children:
+                q.append(child)
+        return r
+
+    @cached_attribute
+    def _ancestors(self):
+        r = []
+        p = self
+        while p:
+            r.append(p)
+            p = p.parent
+        return r[::-1]
+
+    @cached_attribute
+    def children(self):
+        return MatchedStrList(
+            [psl.pid for psl in self._children], copy=True)
+
+    @cached_attribute
+    def descendants(self):
+        return MatchedStrList(
+            [psl.pid for psl in self._descendants], copy=True)
+
+    @cached_attribute
+    def ancestors(self):
+        return MatchedStrList(
+            [psl.pid for psl in self._ancestors], copy=True)
+
+
+    def get_mstr(self, column, forest=False):
+        result = self[column].mstr
+        if forest:
+            result = self.forest_prefix + result
+        return result
+
+
+def get_operator(s):
+    return {'==' : operator.eq,
+            '!=' : operator.ne,
+            '>=' : operator.ge,
+            '>'  : operator.gt,
+            '<=' : operator.le,
+            '<'  : operator.lt,
+            '=~' : '=~', # ignored
+            '!~' : '!~', # ignored
+
+            'not' : operator.not_,
+
+            'and' : operator.and_,
+            'or' : operator.or_,
+            'contains' : 'contains', # ignored
+
+            }[s]
+
+class MatcherExprBase(object):
+    def __init__(self, operator_name, *operands):
+        self.operator_name = operator_name.lower()
+        self.operator = get_operator(self.operator_name)
+        self.operands = operands
+        self._init_operands(*operands)
+
+    def _init_operands(self, *operands):
+        pass
+
+    def __str__(self):
+        return (" %s "%(self.operator_name)).join(map(str, self.operands))
+
+    def all_columns(self):
+        return [
+            c
+            for m in self.all_matchers()
+            for c in m.all_columns() ]
+
+
+class ColumnMatcher(MatcherExprBase):
+
+    fieldnames = ('lhs', 'rhs')
+
+    def _init_operands(self, lhs, rhs):
+        self.lhs = lhs
+        self.rhs = rhs
+
+    def storematch(self, psline, regexp, store):
+        if isinstance(self.lhs, Column):
+            value = psline[self.lhs]
+            return value.storematch(regexp, store=store)
+        else:
+            if regexp == '.' or regexp.pattern == '.':
+                return True
+            value = str(self.lhs)
+            return bool(regexp.search(value))
+
+    def match(self, psline, store=True):
+        lhs = self.lhs
+        assert not isinstance(lhs, ProcRefValue)
+        if isinstance(lhs, Column):
+            lhs = psline[lhs]
+        rhs = self.rhs
+        assert not isinstance(rhs, ProcRefValue)
+        if isinstance(rhs, Column):
+            rhs = psline[rhs]
+        return self._match1(lhs, rhs, psline, store=store)
+
+    def all_matchers(self):
+        return [self]
+
+    @property
+    def args(self):
+        return [self.lhs, self.rhs]
+
+    def all_columns(self):
+        result = []
+        for arg in self.args:
+            if isinstance(arg, Column):
+                result.append(arg)
+            elif isinstance(arg, ProcRefValue):
+                result.append(arg.column)
+        return result
+
+class RegexpMatcher(ColumnMatcher):
+    def _match1(self, lhs, rhs, psline, store):
+        return self.storematch(psline, rhs, store)
+
+class NegRegexpMatcher(ColumnMatcher):
+    def _match1(self, lhs, rhs, psline, store):
+        b = rhs.search(str(lhs))
+        return b and self.storematch(psline, '.', store)
+
+class ContainsMatcher(ColumnMatcher):
+    def _match1(self, lhs, rhs, psline, store):
+        assert self.operator_name == 'contains'
+        if isinstance(lhs, list):
+            return any(str(x) == rhs for x in lhs)
+        if not isinstance(lhs, MatchedStrList):
+            raise Exception(
+                "'contains' operator only applies to lists ('children', 'descendants', 'ancestors') not to %r" % (self.lhs,))
+        found_any = False
+        searchvalue = str(rhs)
+        for subvalue in lhs.mstrs:
+            if str(subvalue) == searchvalue:
+                found_any = True
+                subvalue.storematch('.', store=store)
+                # Don't break, since we want to keep store all matches for
+                # highlighting.
+        return found_any
+
+# Works for e.g. pid==123, pcpu>=5, user=='quarl'
+class CmpMatcher(ColumnMatcher):
+    def _match1(self, lhs, rhs, psline, store):
+        # Coerce types.  This is important for numeric values.  But do <>
+        # comparisons using floating point even if user specified integer
+        # operand.
+        assert not isinstance(lhs, ProcRefValue)
+        assert not isinstance(rhs, ProcRefValue)
+        if isinstance(lhs, float) or isinstance(rhs, float):
+            lhs = float(lhs)
+            rhs = float(rhs)
+        elif isinstance(lhs, int) or isinstance(rhs, int):
+            if self.operator_name not in ['==','!=']:
+                lhs = float(lhs)
+                rhs = float(rhs)
+            else:
+                lhs = int(lhs)
+                rhs = int(rhs)
+        else:
+            lhs = str(lhs)
+            rhs = str(rhs)
+        b = self.operator(lhs, rhs)
+        return b and self.storematch(psline, '.', store)
+
+    def __str__(self):
+        return "%s %s %r" % (self.lhs, self.operator_name, self.rhs)
+
+class UnaryOpExpr(MatcherExprBase):
+
+    fieldnames = ('operand',)
+
+    def _init_operands(self, operand):
+        self.operand = operand
+
+    def match(self, psline, store=True):
+        store = store and not (self.operator_name == 'not')
+        return self.operator(self.operand.match(psline, store=store))
+
+    def all_matchers(self): return self.operand.all_matchers()
+
+    def __str__(self):
+        return "%s %s" %(self.operator_name, self.operand)
+
+class BinaryOpExpr(MatcherExprBase):
+    def match(self, psline, store=True):
+        # Note: we don't want to "shortcut" the operation: if the first
+        # subexpression matches, we still want to test the next one for its
+        # side effect of highlighting matches.
+        return reduce(self.operator, [bool(m.match(psline,store=store)) for m in self.operands])
+
+    def all_matchers(self):
+        return reduce(operator.add, [m.all_matchers() for m in self.operands])
+
+_tokenize = make_tokenizer([
+        Spec('space', r'[ \t\r\n]+'),
+        Spec('number', r'[0-9]+([.][0-9]*)?'),
+        Spec('string', '"([^\"]*)"|' + "'([^\']*)'"),
+        Spec('regexp', r'/((?:[^/]|\\/)*)/(i)?'),
+        Spec('re_op', r'=~'),
+        Spec('nre_op', r'!~'),
+        Spec('cmp_op', r'==|!=|>=|>|<=|<'),
+        Spec('cnt_op', r'(contains|CONTAINS)\b'),
+        Spec('and', r'&&|(and|AND)\b'),
+        Spec('or', r'[|][|]|(or|OR)\b'),
+        Spec('not', r'!|(not|NOT)\b'),
+        Spec('(', r'[(]'),
+        Spec(')', r'[)]'),
+        Spec('procs', r'(procs|PROCs|threads|THREADS)\b'),
+        Spec('[', r'[\[]'),
+        Spec(']', r'[\]]'),
+        Spec('self', r'(self|SELF)\b'),
+        Spec('.', r'[.]'),
+        Spec('column', r'%?([a-z]+|[A-Z]+)\b#?'),
+        # Spec('{', r'{'),
+        # Spec('}', r'}'),
+        ])
+
+def parse_regexp_flags(flags):
+    ''' parse_regexp_flags("mi") => re.M | re.I '''
+    return reduce(operator.or_, (getattr(re,f.upper()) for f in flags), 0)
+
+class Regexp(object):
+    def __init__(self, pattern, flags):
+        self._sflags = flags
+        self.pattern = pattern
+        self.regexp = re.compile(pattern, parse_regexp_flags(flags))
+
+    def __str__(self):
+        return "/%s/%s" % (self.pattern.replace("/","\\/"), self._sflags)
+
+    def __getattr__(self, x):
+        return getattr(self.regexp, x)
+
+
+
+class ProcRef(object):
+    def __init__(self, mapname, pid):
+        self.mapname = mapname # 'procs' or 'threads'
+        self.pid = pid
+
+
+ProcRef.SELF = ProcRef('procs', getpid())
+
+
+class ProcRefValue(object):
+    def __init__(self, procref, column):
+        assert isinstance(procref, ProcRef)
+        assert isinstance(column, Column)
+        self.procref = procref
+        self.column = column
+
+
+
+class MyOptionParser(optparse.OptionParser):
+
+    def _process_short_opts(self, rargs, values):
+        # Customize the handling of options that start with a single dash.
+        arg = rargs[0]
+        assert arg.startswith("-")
+        # Allow -no-color in addition to --no-color.
+        if self._long_opt.get("-"+arg):
+            rargs[0] = "-" + arg
+            return self._process_long_opt(rargs, values)
+        # Detect "-xoy" (with some option that takes an argument,
+        # e.g. -no-blah, where it also isn't a long option), and disallow it;
+        # require it to be "-x -o y".
+        i = 1
+        for ch in arg[1:]:
+            opt = "-" + ch
+            option = self._short_opt.get(opt)
+            i += 1
+            if not option:
+                raise optparse.BadOptionError(opt)
+            if option.takes_value():
+                if i > 2:
+                    raise optparse.OptParseError(
+                        "%s option must specified as a separate argument from other options (%s => %s %s...)"
+                        % (opt, arg, arg[:i-1], opt))
+                else:
+                    break
+        return optparse.OptionParser._process_short_opts(self, rargs, values)
+
+
+def _make_parser():
+    def tokval(t): return t.value
+    def sometype(type): return some(lambda t: t.type == type)
+    def make_column(t):
+        return Column(t.value)
+    def make_number(t):
+        try:
+            return int(t.value)
+        except ValueError:
+            return float(t.value)
+    def make_string(t):
+        g1, g2 = t.m.groups()
+        return g1 if g1 is not None else g2
+    def make_regexp(t):
+        regexp, flags = t.m.groups()
+        regexp = regexp.replace("\\/", "/")
+        return Regexp(regexp, flags or '')
+    def make_infix_op(Matcher):
+        def f(args):
+            (operand1, operator_name, operand2) = args
+            return Matcher(operator_name, operand1, operand2)
+        return f
+    def make_bin_expr(args):
+        (expr, more_exprs) = args
+        if not more_exprs:
+            return expr
+        return BinaryOpExpr(more_exprs[0][0].type, expr, *[e for o,e in more_exprs])
+    def make_unary_expr(args):
+        (op, expr) = args
+        return UnaryOpExpr(op.type, expr)
+    def make_proc_ref(args):
+        (mapname, pid) = args
+        mapname = mapname.lower()
+        assert mapname in ['procs', 'threads']
+        if int(pid) != pid:
+            raise NoParseError("proc[] operand must be integer, not %r" % (pid,))
+        return ProcRef(mapname, int(pid))
+    def make_proc_self_ref(op):
+        return ProcRef.SELF
+    def make_proc_ref_value(args):
+        (procref, column) = args
+        return ProcRefValue(procref, column)
+    column = sometype('column') >> make_column
+    number = sometype('number') >> make_number
+    string = sometype('string') >> make_string
+    procref1 = (sometype('procs') >> tokval) + skip(sometype('[')) + number + skip(sometype(']')) >> make_proc_ref
+    procref_self = sometype('self') >> make_proc_self_ref
+    procref = procref1 | procref_self
+    procrefval = procref + skip(sometype('.')) + column >> make_proc_ref_value
+    value = column | string | number | procrefval
+    regexp = sometype('regexp') >> make_regexp
+    regexp_matcher = value + (sometype('re_op') >> tokval) + regexp >> make_infix_op(RegexpMatcher)
+    nregexp_matcher = value + (sometype('nre_op') >> tokval) + regexp >> make_infix_op(NegRegexpMatcher)
+    contains_matcher = value + (sometype('cnt_op') >> tokval) + value >> make_infix_op(ContainsMatcher)
+    cmp_op = sometype('cmp_op') >> tokval
+    cmp_matcher = value + cmp_op + value >> make_infix_op(CmpMatcher)
+    matcher = contains_matcher | nregexp_matcher | regexp_matcher | cmp_matcher
+    primary = with_forward_decls(lambda: not_paren_expr | paren_expr | matcher)
+    and_expr = primary + many(sometype('and') + primary) >> make_bin_expr
+    or_expr = and_expr + many(sometype('or') + and_expr) >> make_bin_expr
+    expr = or_expr
+    paren_expr = skip(sometype('(')) + expr + skip(sometype(')'))
+    not_paren_expr = sometype('not') + paren_expr >> make_unary_expr
+    top_level = expr + skip(finished)
+    return top_level.parse
+
+_parse = _make_parser()
+
+def parse_matcher(s):
+    try:
+        tokens = [t for t in _tokenize(s) if t.type != 'space']
+    except LexerError as e:
+        raise SystemExit("Bad expression (lex error: %s): %r" % (e, s))
+    try:
+        return _parse(tokens)
+    except InvalidColumnError as e:
+        raise SystemExit("Bad expression (%s): %r" % (e, s))
+    except ParserError as e:
+        raise SystemExit("Bad expression (parse error: %s): %r" % (e, s))
+
+class XPS(object):
+    '''Main class.'''
+
+    def main(self, args):
+        # Note that traceprocess executes these steps individually.
+        self.getopts(args)
+        self.run_ps()
+        self.postprocess_setup()
+        self.postprocess_filter()
+        try:
+            self.forested_output()
+        except IOError as e:
+            # If we're piping to a process that doesn't want further data,
+            # just exit quietly.
+            if e.errno == errno.EPIPE:
+                raise SystemExit(32)
+            raise
+
+    def run_ps(self):
+        self.construct_ps_args()
+        self.pipe_ps()
+        self.parse_ps()
+        self.parse_sps()
+
+    def postprocess_setup(self):
+        self.postprocess_scale_pcpu()
+        self.postprocess_compute_ranks() # must rank before filtering
+        self.postprocess_sort() # must sort before foresting
+        self.postprocess_compute_relationships()
+        self.postprocess_buildforest() # must forest before filtering
+        self.postprocess_instantiate_refvalues()
+
+    def forested_output(self, prefix=''):
+        self.compute_forest_relationships()
+        self.annotate_forest_relationships()
+        self.output(prefix=prefix)
+
+    def getopts(self, args):
+        parser = MyOptionParser()
+        def print_version_and_exit(*args):
+            print("xps %s" % (__version__,))
+            raise SystemExit
+        parser.add_option("--version", action="callback",
+                          callback=print_version_and_exit)
+        # TODO: on non-Solaris, hide this option but make it available as a dummy option for compatibility
+        parser.add_option("--use-sps", action="store_true", default=True,
+                          help="Use sps for userspace command args, when needed")
+        parser.add_option("--no-use-sps", action="store_false", dest="use_sps",
+                          help="Don't use sps for userspace command args, when needed")
+        def columns_callback(option, opt_str, value, parser):
+            mode = 'replace'
+            if value.startswith("+"):
+                mode = 'add'
+                value = value[1:]
+            elif value.startswith("-"):
+                mode = 'remove'
+                value = value[1:]
+            mod_columns = comma_split_list([value])
+            mod_columns = list(map(Column, mod_columns))
+            columns = parser.values.columns
+            if mode == 'add':
+                columns.update(mod_columns)
+            elif mode == 'remove':
+                columns.difference_update(mod_columns)
+            else:
+                columns.clear()
+                columns.update(mod_columns)
+
+        parser.add_option("--columns", action="callback", type="string",
+                          callback=columns_callback, default=set(DEFAULT_COLUMNS),
+                          help=("Change output columns. "
+                                "Prepend '+' to add; prepend '-' to remove; "
+                                "otherwise replace. "
+                                "Default: " + ','.join(sorted(map(str, DEFAULT_COLUMNS)))))
+        def verbose_callback(option, opt_str, value, parser):
+            columns = parser.values.columns
+            columns.update(DEFAULT_COLUMNS+VERBOSE_COLUMNS)
+        parser.add_option("--verbose", "-v", action="callback", callback=verbose_callback,
+                          help=("Equivalent to --columns=+" +
+                                ','.join(sorted(map(str, DEFAULT_COLUMNS+VERBOSE_COLUMNS)))))
+        def o_callback(option, opt_str, value, parser):
+            mod_columns = comma_split_list([value])
+            mod_columns = list(map(Column, mod_columns))
+            columns = parser.values.columns
+            columns.update(mod_columns)
+        parser.add_option("-o", action="callback", type="string",
+                          callback=o_callback,
+                          help=("Equivalent to --column=+..."))
+        def pid_only_callback(option, opt_str, value, parser):
+            columns = parser.values.columns
+            columns.clear()
+            columns.add(Column('pid'))
+            parser.values.header = False
+            parser.values.forest = False
+        parser.add_option("--pid-only", "-n", action="callback", callback=pid_only_callback,
+                          help=("Show only PID column: equivalent to "
+                                "--columns=pid --no-header --no-forest"))
+        def threads_callback(option, opt_str, value, parser):
+            parser.values.threads = True
+            parser.values.columns.add(Column('tid'))
+        def no_threads_callback(option, opt_str, value, parser):
+            parser.values.threads = False
+            parser.values.columns.discard(Column('tid'))
+        parser.add_option("--threads", "-T", "-t", action="callback", callback=threads_callback,
+                          dest="threads", default=False,
+                          help=("Show threads (implies --columns=+tid)"))
+        parser.add_option("--no-threads", action="callback", callback=no_threads_callback,
+                          help=("Don't show threads (implies --column=-tid)"))
+        def filter_callback(option, opt_str, value, parser):
+            parser.values.filter.append(parse_matcher(value))
+        def remove_callback(option, opt_str, value, parser):
+            parser.values.remove.append(parse_matcher(value))
+        def match_callback(option, opt_str, value, parser):
+            parser.values.match.append(parse_matcher(value))
+        parser.add_option("--filter", action="callback", callback=filter_callback, type="string", default=[],
+                          help="""Add a filter.  Example syntax:
+                             COMMAND =~ /python/i && %CPU >= 1.0 && !(TTY == '?')
+                             - COLUMN==X: value equals string or integer exactly.
+                             - COLUMN>=N: value >= floating point value.
+                             - COLUMN#<=N: value is in top N.
+                             - COLUMN=~/regexp/[i]: value matches regexp.
+                             - COLUMN contains N: for list columns.
+                             The pseudo column 'COMMAND0' refers to the
+                             first word of 'COMMAND'.  The pseudo column
+                             'EXECUTABLE' reads the true executable absolute
+                             path from /proc if available, else returns
+                             COMMAND0.  Pseudo columns such as
+                             %CPU# and %MEM# refer to the 'rank' (sort order)
+                             of the column.  'CHILDREN', 'DESCENDANTS', and
+                             'ANCESTORS' are list columns that use the
+                             'contains' operator.  The filter can contain
+                             arbitrary boolean expressions such as (a && !(b
+                             || c)).  All separately specified filters must
+                             match (they are ANDed). (If no filters are
+                             specified, all lines are shown.)  Highlighting is
+                             done for matches on columns specified on
+                             left-hand side of non-negated expressions.  "FOO
+                             == 123" highlights resulting columns, but "123 ==
+                             FOO" and "!(FOO != 123)" do not highlight.
+                          """)
+        parser.add_option("--remove", action="callback", callback=remove_callback, type="string", default=[],
+                          help="""Add a removal filter.  Similar to
+                          --filter='!(...)', but removed lines are not
+                          included by --include-matched-descendants, nor
+                          --include-matched-ancestors, and does no
+                          highlighting.""")
+        parser.add_option("--match", action="callback", callback=match_callback, type="string", default=[],
+                          help=("Add a match for column value.  "
+                                "Similar to --filter, with same syntax, but "
+                                "only colorizes (unmatched lines are still included)."))
+        # TODO: support matching in different color?
+        parser.add_option("--match-this-user", action="store_true", default=Ellipsis,
+                          help="Highlight this user (equivalent to --match='USER==$USER') [default when no filters/matchers]")
+        parser.add_option("--no-match-this-user", action="store_false", dest="match_this_user",
+                          help="Don't highlight this user")
+        parser.add_option("--match-this-tty", action="store_true", default=Ellipsis,
+                          help="Highlight this tty (equivalent to --match='TTY==$TTY') [default when no filters/matchers]")
+        parser.add_option("--no-match-this-tty", action="store_false", dest="match_this_tty",
+                          help="Don't highlight this tty")
+        parser.add_option("--filter-user", "--user", "-U", "-u", action="append", default=[],
+                          help="Filter by users (equivalent to --filter=(USER==... || USER=...))", metavar="USER")
+        parser.add_option("--filter-pid", "--pid", "-P", "-p", action="append", default=[],
+                          help="Filter by PIDs (equivalent to --filter=(PID==... || PID=...))", metavar="PID")
+        parser.add_option("--filter-command", "--command", action="append", default=[],
+                          help="Filter by command/args (equivalent to --filter=(COMMAND=~/.../i || COMMAND=~...))", metavar="PATTERN")
+        parser.add_option("--filter-executable", "--executable", action="append", default=[],
+                          help="Filter by command executable name (equivalent to --filter=(EXECUTABLE=~/.../i || EXECUTABLE=~...)", metavar="PATTERN")
+        parser.add_option("--filter-text", action="append", default=[],
+                          help="Filter by regexp in output text fields (equivalent to --filter=(USER=~/.../i || COMMAND~=/.../i || TTY=~/.../i || ...)", metavar="PATTERN")
+        parser.add_option("--filter-tty", "--tty", action="append", default=[],
+                          help="Filter by TTYs (equivalent to --filter=(TTY==... | TTY==...))", metavar="TTY")
+        parser.add_option("--this-user-only", action="store_true", default=False,
+                          help="Filter by this user (equivalent to --user $USER)")
+        parser.add_option("--this-tty-only", action="store_true", default=False,
+                          help="Filter by this TTY (equivalent to --filter=(TTY==$TTY))")
+        parser.add_option("--this-session-only", action="store_true", default=False,
+                          help="Filter by processes with the same SID as this process (equivalent to --filter=(SID==$SID))")
+        parser.add_option("--include-matched-descendants", "--include-descendants", "--descendants", "-r",
+                          action="store_true", default=False,
+                          help="Also include descendants of processes matched by filter.")
+        parser.add_option("--include-matched-ancestors", "--include-ancestors", "--ancestors", "-R",
+                          action="store_true", default=False,
+                          help="Also include ancestors of processes matched by filter.")
+        def pigs_callback(option, opt_str, value, parser):
+            parser.values.filter.append(
+                BinaryOpExpr('or',
+                             CmpMatcher('>=', Column('%cpu'), 10),
+                             CmpMatcher('>=', Column('%mem'), 10)))
+        parser.add_option("--pigs", action="callback", callback=pigs_callback,
+                          help="Equivalent to --filter='(%CPU >= 10 || %MEM >= 10)'")
+        def top_callback(option, opt_str, value, parser):
+            parser.values.filter.append(
+                BinaryOpExpr('or',
+                             CmpMatcher('<=', Column('%cpu#'), 6),
+                             CmpMatcher('<=', Column('%mem#'), 6)))
+            parser.values.sort = [Column('%cpu'), Column('%mem')]
+        parser.add_option("--top", action="callback", callback=top_callback,
+                          help="Equivalent to --filter='(%CPU# <= 6 || %MEM# <= 6)' --sort=%cpu,%mem")
+        def filter_clear_callback(option, opt_str, value, parser):
+            parser.values.filter[:] = []
+        parser.add_option("--clear-filter", action="callback", callback=filter_clear_callback,
+                          help="Clear previous filter entries")
+        def remove_clear_callback(option, opt_str, value, parser):
+            parser.values.remove[:] = []
+        parser.add_option("--clear-remove", action="callback", callback=remove_clear_callback,
+                          help="Clear previous remove entries")
+        def match_clear_callback(option, opt_str, value, parser):
+            parser.values.match[:] = []
+        parser.add_option("--clear-match", action="callback", callback=match_clear_callback,
+                          help="Clear previous match entries")
+        def sort_callback(option, opt_str, value, parser):
+            mod_columns = comma_split_list([value])
+            mod_columns = list(map(Column, mod_columns))
+            parser.values.sort = tuple(mod_columns)
+        parser.add_option("--sort", action="callback", callback=sort_callback, type="string", default=[Column('pid')],
+                          help=("""Sort by column(s).
+                                Default is PID; use --sort='' to get default
+                                ps output order.  Foresting affects output
+                                order, so you may also want --no-forest."""),
+                          metavar="COLUMN")
+        parser.add_option("--header", action="store_true", default=True,
+                          help="Show header row")
+        parser.add_option("--no-header", action="store_false", dest="header",
+                          help="Don't show header row")
+        parser.add_option("--hideself", action="store_true", default=True,
+                          help="Exclude xps process and descendants from output "
+                          "(Equivalent to --remove='self.descendants contains pid')")
+        parser.add_option("--no-hideself", action="store_false", dest="hideself",
+                          help="Don't exclude xps process and descendants from output")
+        parser.add_option("--hideparent", action="store_true", default=False,
+                          help="Exclude parent of xps process from output. "
+                          "(Equivalent to --remove='pid == self.ppid')")
+        parser.add_option("--no-hideparent", action="store_false", dest="hideparent",
+                          help="Don't exclude parent of xps process from output")
+        parser.add_option("--hideancestors", action="store_true", default=False,
+                          help="Exclude xps process and ancestors from output. "
+                          "(Equivalent to --remove='self.ancestors contains pid')")
+        parser.add_option("--no-hideancestors", action="store_false", dest="hideancestors",
+                          help="Don't exclude xps process and ancestors")
+        parser.add_option("--hidezombies", action="store_true", default=False,
+                          help=("Exclude zombie processes "
+                                "(Equivalent to --remove='state==\"Z\"')"))
+        parser.add_option("--no-hidezombies", action="store_false", dest="hidezombies",
+                          help="Don't exclude zombie processes (default)")
+        parser.add_option("--hidekernel", "--filter-kernel", action="store_true", default=Ellipsis,
+                          help="Filter by non-kernel processes (equivalent to --filter=!(vsz==0)) [default when no filters/matchers]")
+        parser.add_option("--no-hidekernel", "--no-filter-kernel", action="store_false", dest="hidekernel",
+                          help="Don't filter non-kernel processes")
+        def hide_descendants_of_callback(option, opt_str, value, parser):
+            parser.values.remove.append(
+                ContainsMatcher('contains', 'ancestors', value))
+        parser.add_option("--hide-descendants-of", action="callback",
+                          callback=hide_descendants_of_callback,
+                          metavar="PID", type="int",
+                          help=("Don't show descendants of given PID. "
+                                "(Equivalent to --remove='ancestors contains PID')"))
+        def all_callback(option, opt_str, value, parser):
+            parser.values.filter[:] = []
+            parser.values.remove[:] = []
+            parser.values.filter_user[:] = []
+            parser.values.filter_command[:] = []
+            parser.values.filter_executable[:] = []
+            parser.values.filter_text[:] = []
+            parser.values.hideself = False
+            parser.values.hideparent = False
+            parser.values.hideancestors = False
+            parser.values.hidekernel = False
+        parser.add_option("--all", "-a", action="callback", callback=all_callback,
+                          help="Show all processes; clear all filtering options")
+        parser.add_option("--color", action="store_true", default=os.isatty(1),
+                          help="Highlight filter matches")
+        parser.add_option("--no-color", action="store_false", dest="color",
+                          help="Don't highlight filter matches")
+        parser.add_option("--forest", "-f", "--tree", action="store_true", default=AUTOMATIC,
+                          help="Show tree/forest (default: iff COMMAND/COMMAND0/EXECUTABLE in columns)")
+        parser.add_option("--no-forest", "--no-tree", action="store_false", dest="forest",
+                          help="Don't show tree/forest")
+        parser.add_option("--screen-width", type="int", default=get_winsz_columns(),
+                          help="Maximum characters per line in output")
+        parser.add_option("--wide", action="store_const", dest="screen_width", const=0,
+                          help=("No maximum screen width; default when stdout is not a tty. "
+                                "(Equivalent to --screen-width=0)"))
+        def pcpu_scale_callback(option, opt_str, value, parser):
+            try:
+                parser.values.pcpu_scale = {
+                    "percpu": "per_cpu",
+                    "linux": "per_cpu",
+                    "darwin": "per_cpu",
+                    "osx": "per_cpu",
+                    "irix": "per_cpu",
+                    "permachine": "per_machine",
+                    "solaris": "per_machine",
+                    "perhost": "per_machine",
+                    "persystem": "per_machine",
+                    "osdefault": "os_default",
+                    "default": "os_default",
+                    }[re.sub("[^a-z]", "", value.lower())]
+            except KeyError:
+                raise Exception(
+                    "Invalid --scale_pcu=%s; valid values are "
+                    "PER_CPU, PER_MACHINE, or OS_DEFAULT" % (value,))
+        parser.add_option("--pcpu_scale", "--scale_pcpu", type="str",
+                          metavar="{PER_CPU|PER_MACHINE|OS_DEFAULT}",
+                          default="os_default",
+                          action="callback", callback=pcpu_scale_callback,
+                          help=("Method of scaling %CPU output on a multi-core machine."
+                                "  PER_CPU/LINUX/IRIX means %CPU of a"
+                                " single-threaded process is in the range [0, 100%]."
+                                "  PER_MACHINE/SOLARIS means %CPU of a"
+                                " single-threaded process is in the range [0, 100%/NUM_VIRTUAL_CPUs]."
+                                "  The default is OS_DEFAULT."))
+
+        # parser.add_option("--wrap", action="store_true",
+        #                   help=("Wrap long command lines at screen width "
+        #                         "instead of truncating"))
+        # parser.add_option("--no-wrap", "--truncate", action="store_false", dest="wrap",
+        #                   help=("Wrap long command lines at screen width "
+        #                         "instead of truncating"))
+
+        # TODO: wrap option to wrap long command-lines
+
+        opts, args = parser.parse_args(args)
+
+        for arg in args:
+            if is_int(arg):
+                opts.filter_pid.append(int(arg))
+            else:
+                opts.filter_text.append(arg)
+
+        # We add these matchers at the end because if they are specified
+        # multiple times (including using implicit positional args), those
+        # should OR with each other; then AND with remaining filters.
+        if opts.filter_pid:
+            m = [CmpMatcher("==", Column("pid"), pid)
+                 for pid in opts.filter_pid]
+            opts.filter.append(BinaryOpExpr('or', *m))
+
+        if opts.this_user_only:
+            opts.filter_user.append(get_user_name())
+
+        if opts.filter_user:
+            m = [CmpMatcher("==", Column("user"), user)
+                 for user in opts.filter_user]
+            opts.filter.append(BinaryOpExpr('or', *m))
+
+        if opts.filter_command:
+            m = [RegexpMatcher('=~', Column("command"), Regexp(command, 'i'))
+                 for command in opts.filter_command]
+            opts.filter.append(BinaryOpExpr('or', *m))
+
+        if opts.filter_executable:
+            m = [RegexpMatcher('=~', Column("executable"), Regexp(executable, 'i'))
+                 for executable in opts.filter_executable]
+            opts.filter.append(BinaryOpExpr('or', *m))
+
+        if opts.filter_text:
+            m = []
+            for column in TEXT_SEARCH_COLUMNS:
+                m += [RegexpMatcher('=~', column, Regexp(arg, 'i'))
+                      for arg in opts.filter_text]
+            opts.filter.append(BinaryOpExpr('or', *m))
+
+        if opts.this_tty_only:
+            tty = get_tty_name()
+            if tty:
+                opts.filter_tty.append(tty)
+
+        if opts.filter_tty:
+            # Remove "/dev/" prefix.  TODO: this should apply to even
+            # --filter='TTY==...
+            opts.filter_tty = [
+                remove_tty_dev_prefix(s)
+                for s in opts.filter_tty ]
+            m = [CmpMatcher("==", Column("tty"), arg)
+                 for arg in opts.filter_tty]
+            opts.filter.append(BinaryOpExpr('or', *m))
+
+        if opts.this_session_only:
+            sid = os.getsid(getpid())
+            opts.filter.append(CmpMatcher("==", Column("sid"), sid))
+
+        any_filters_matchers = bool(opts.filter or opts.match or opts.remove)
+
+        if opts.hidekernel is Ellipsis:
+            opts.hidekernel = not any_filters_matchers
+        if opts.hidekernel:
+            opts.filter.append(
+                UnaryOpExpr('not', CmpMatcher('==', Column('vsz'), '0')))
+
+        if opts.match_this_user is Ellipsis:
+            opts.match_this_user = not any_filters_matchers
+        if opts.match_this_user:
+            opts.match.append(
+                CmpMatcher("==", Column("user"), get_user_name()))
+
+        if opts.match_this_tty is Ellipsis:
+            opts.match_this_tty = not any_filters_matchers
+        if opts.match_this_tty:
+            tty = get_tty_name()
+            if tty:
+                opts.match.append(
+                    CmpMatcher("==", Column("tty"),
+                               remove_tty_dev_prefix(get_tty_name())))
+
+        if opts.hideself:
+            # Equivalent to --remove='self.descendants contains pid'
+            # We used to do --remove='ancestors contains self.pid', but that
+            # suffers from O(N^2) behavior where N is the depth of the process
+            # tree.  E.g. if some job goes out of control and forks a really
+            # deep tree of 20,000 processes, then checking 'ancestors' for
+            # every one of them will take O(20000^2) time.
+            opts.remove.append(
+                ContainsMatcher('contains', ProcRefValue(ProcRef.SELF, Column('descendants')),
+                                Column('pid')))
+
+        if opts.hideparent:
+            opts.remove.append(
+                CmpMatcher('==', Column('pid'), getppid()))
+
+        if opts.hideancestors:
+            # Equivalent to --remove='self.ancestors contains pid'
+            # We used to do --remove='descendants contains self.pid', but that
+            # suffers from O(N^2) behavior where N is the depth of the process
+            # tree.  (We'll still suffer if this xps process is at the bottom
+            # of some huge process tree, but that's less likely, and more
+            # self-contained, not suffering from other people's problems.)
+            opts.remove.append(
+                ContainsMatcher('contains', ProcRefValue(ProcRef.SELF, Column('ancestors')),
+                                Column('pid')))
+
+        if opts.hidezombies:
+            opts.remove.append(
+                CmpMatcher('==', Column('s'), 'Z'))
+
+        if opts.forest is AUTOMATIC:
+            opts.forest = (
+                Column("command") in opts.columns
+                or Column("command0") in opts.columns
+                or Column("executable") in opts.columns)
+
+        # If not colorizing (e.g. because not a tty), then match does
+        # nothing.  As an optimization, we can clear all matches (if any) now.
+        if not opts.color:
+            opts.match = []
+
+        # Complain if zero columns specified.  This only happens if the
+        # user explicitly used '--columns=""'.
+        if not opts.columns:
+            raise ValueError("no columns specified")
+
+        self.opts = opts
+
+    def construct_ps_args(self):
+        opts = self.opts
+        ps_args = []
+
+        # We used to utilize the -U and -P options to ps.  We no longer do so,
+        # because:
+        #   - We don't gain much speed by not filtering ourselves.
+        #   - -U root doesn't work.
+        #   - We can build the full forest before filtering.
+        #   - We know the full %CPU,%MEM,etc. ranking before filtering.
+        #   - Less platform-specificness to worry about (whether -P or -p)
+        #   - Simplifies code.
+
+        if uname == 'Linux':
+            ps_args.append('axww')
+            if opts.threads:
+                ps_args.append('H')
+        elif uname == 'SunOS':
+            ps_args.append('-e')
+            if opts.threads:
+                raise NotImplementedError
+        elif uname == 'BSD':
+            ps_args.append('ax')
+            if opts.threads:
+                raise NotImplementedError
+        elif uname == 'Darwin':
+            ps_args.append('ax')
+            if opts.threads:
+                raise NotImplementedError
+        else:
+            raise NotImplementedError("don't know how to deal with OS %r" % uname)
+
+        # We may need some extra info that the user doesn't want to see, in
+        # order to filter, compute forest, etc.
+        needed_columns = self.needed_columns = set(opts.columns)
+        for matcher in opts.filter + opts.match + opts.remove:
+            all_columns = matcher.all_columns()
+            needed_columns.update(all_columns)
+        needed_columns.update(opts.sort)
+        needed_columns.add(Column('pid'))
+        needed_columns.add(Column('ppid'))
+        assert all(isinstance(c, Column) for c in needed_columns)
+
+        ps_args += format_column_args(needed_columns)
+
+        self.ps_args = ps_args
+
+    def pipe_ps(self):
+        # Start ps, and sps if applicable; then wait for both.  Use the full
+        # path as who knows which ps is first in $PATH (e.g. /usr/ucb/ps).
+        ps_proc = subprocess.Popen(['/bin/ps'] + self.ps_args,
+                                   stdout=subprocess.PIPE, bufsize=-1)
+        self.ps_pid = ps_proc.pid
+
+        sps_proc = None
+        if self.opts.use_sps and uname == 'SunOS' and Column('command') in self.needed_columns:
+            try:
+                sps_proc = subprocess.Popen(
+                    ['sps', '-a', '-w'],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    bufsize=-1)
+            except OSError:
+                pass
+        if sps_proc:
+            self.sps_pid = sps_proc.pid
+            self.sps_output = sps_proc.communicate()[0]
+            if type(self.sps_output) is not str: # py3
+                self.sps_output = self.sps_output.decode("utf-8")
+        else:
+            self.sps_pid = None
+            self.sps_output = None
+
+        self.ps_output = ps_proc.communicate()[0]
+        if type(self.ps_output) is not str: # py3
+            self.ps_output = self.ps_output.decode("utf-8")
+
+
+    def parse_ps(self):
+        raw_pslines = self.ps_output.splitlines()
+        self.ps_header = raw_pslines.pop(0)
+        self.output_columns = [Column(parse_column_header(x)) for x in self.ps_header.split()]
+        self.set_output_columns = set(self.output_columns)
+        self.pslines = [PsLine(line, self.output_columns) for line in raw_pslines]
+        for column in self.needed_columns:
+            column = column.physical_column
+            if column not in self.set_output_columns:
+                logging.error("Requested column '%s' but didn't get it [columns: %r]",
+                              column, self.output_columns)
+
+    def check_expected_columns(self, feature, *columns):
+        missing_columns = [
+            col
+            for col in columns
+            if Column(col) not in self.set_output_columns]
+        if missing_columns:
+            logging.error("Skipping %s because missing columns %r",
+                          feature, missing_columns)
+            return False
+        return True
+
+    def parse_sps(self):
+        # If sps is available, parse its output for Command only.  Sps invades
+        # each process's userspace to get the complete arguments; but we still
+        # want to use 'ps' normally.
+        if not self.sps_output:
+            return
+        procs = dict( (str(psline.pid), psline) for psline in self.pslines )
+        raw_spslines = self.sps_output.splitlines()
+        sps_header = raw_spslines.pop(0)
+        sps_footer = raw_spslines.pop(); del sps_footer
+        m = re.search("Proc# +Command", sps_header)
+        if not m: return
+        parse_start = m.start()
+        for line in raw_spslines:
+            parts = line[parse_start:].split(None, 1)
+            if len(parts) < 2:
+                continue
+            pid, cmd = parts
+            if cmd == '** Exit **':
+                cmd = '<defunct>'
+            if pid in procs:
+                procs[pid].command = MatchedStr(cmd)
+
+    def postprocess_scale_pcpu(self):
+        # If the user wanted %CPU per core or per machine (as opposed to OS
+        # default), then scale it.  Note that the result is less precise.
+        if Column('%cpu') not in self.set_output_columns:
+            return
+        scale = self.opts.pcpu_scale
+        if scale == 'os_default':
+            return
+        os_scale = PCPU_SCALE_OS_DEFAULT[uname]
+        if scale == os_scale:
+            return
+        cpu_count = get_virtual_cpu_count()
+        if cpu_count == 1:
+            return
+        assert cpu_count > 1
+        if scale == 'per_machine' and os_scale == 'per_cpu':
+            mult = 1.0 / cpu_count
+        elif scale == 'per_cpu' and os_scale == 'per_machine':
+            mult = cpu_count
+        else:
+            raise AssertionError
+        for psline in self.pslines:
+            pcpu = float(psline['%cpu'])
+            new_pcpu = mult * pcpu
+            psline['%cpu'] = MatchedStr("%4.1f" % (new_pcpu,))
+
+    def postprocess_compute_ranks(self):
+        # Compute ranks.  E.g., the user wants to filter (or see) "%CPU#"
+        # which refers to the row that a psline would be if sorted by %CPU.
+        #
+        # We do this by first sorting, then grouping equal values together
+        # (which will happen often due to many "0.0"s), then assigning integer
+        # ranks.
+        for column in self.needed_columns:
+            if not column.name.endswith('#'):
+                continue
+            raw_column = Column(remove_suffix(column.name, "#"))
+            skey = raw_column.sort_value
+            def key(psline):
+                return skey(psline[raw_column])
+            pslines = sorted(self.pslines, key=key, reverse=True)
+            rank = len(pslines)
+            for _, group in itertools.groupby(pslines, key):
+                group = list(group)
+                for psline in group:
+                    psline[column] = MatchedStr(str(rank), link=psline[raw_column])
+                rank -= len(group)
+
+    def postprocess_sort(self):
+        # TODO: support '-' prefix to reverse some columns
+        sort_columns = self.opts.sort
+        if not sort_columns: return
+        def key(psline):
+            return [column.sort_value(psline[column])
+                    for column in sort_columns]
+        # print "## sort:",sort_columns,sort_keys, map(key, self.pslines)
+        self.pslines.sort(key=key)
+
+    def postprocess_compute_relationships(self):
+        # Build references between parent and child processes.
+        self.psline_self = None
+        if Column('pid') not in self.set_output_columns:
+            return
+
+        if self.opts.threads and Column('tid') in self.set_output_columns:
+            # Compute map of threads by process id and thread id
+            self.procs = procs = {}
+            self.threads = threads = {}
+            for psline in self.pslines:
+                procs.setdefault(int(psline.pid), []).append(psline)
+                threads[int(psline.tid)] = psline
+            # Move starting thread to front.
+            for pslines in procs.values():
+                for psline in pslines:
+                    if psline.tid == psline.pid:
+                        move_to_front_of_list(pslines, psline)
+                        break
+            for psline in self.pslines:
+                # Connect threads to their starting thread, otherwise a
+                # process to its parent process.
+                tid = int(psline.tid)
+                pid = int(psline.pid)
+                ppid = int(psline.ppid)
+                if psline is procs[pid][0]:
+                    # This is the starting/primary thread of this process
+                    if ppid == pid: # ppid=pid means no parent
+                        continue
+                    try:
+                        psline.parent = procs[ppid][0]
+                    except KeyError:
+                        psline.parent = None
+                else:
+                    # Secondary thread; point to primary thread as parent
+                    psline.parent = procs[pid][0]
+                if psline.parent:
+                    psline.parent._children.append(psline)
+            try:
+                self.psline_self = procs[getpid()][0]
+            except KeyError:
+                self.psline_self = None
+        else:
+            self.procs = procs = dict( (int(psline.pid), psline) for psline in self.pslines )
+            for psline in self.pslines:
+                pid = int(psline.pid)
+                ppid = int(psline.ppid)
+                if pid == ppid:
+                    continue
+                psline.parent = procs.get(ppid)
+                if psline.parent:
+                    psline.parent._children.append(psline)
+            self.psline_self = procs.get(getpid())
+
+        if self.psline_self:
+            if int(self.psline_self.ppid) != getppid():
+                logging.error("ppid(%d)==%d != getppid()==%d!",
+                              self.psline_self.pid, self.psline_self.ppid,
+                              getppid())
+        else:
+            logging.error("Didn't find self (pid %d) in ps output", getpid())
+
+
+    def postprocess_buildforest(self):
+        if not self.opts.forest: return
+        if not self.check_expected_columns('forest', 'pid', 'ppid'): return
+
+        # Re-arrange in forest (DFS) order and annotate with depth.
+        pslines = []
+        for psline in self.pslines:
+            if psline.parent:
+                continue
+            assert psline.parent is not psline
+
+            root = psline.root = psline
+            dfs_queue = [(psline, 0)]
+            while dfs_queue:
+                psline, depth = dfs_queue.pop()
+                psline.depth = depth
+                psline.root = root
+                pslines.append(psline)
+                for child in reversed(psline._children):
+                    dfs_queue.append( (child, depth+1) )
+
+        assert len(pslines) == len(self.pslines)
+        self.pslines[:] = pslines
+
+    def filter_lines(self, pslines, filters,
+                     include_matched_descendants=False,
+                     include_matched_ancestors=False):
+        # Include only processes that match all filters.
+        for line in pslines:
+            line._matched = all(matcher.match(line) for matcher in filters)
+        if not include_matched_descendants and not include_matched_ancestors:
+            filtered_lines = [line for line in pslines if line._matched]
+            return filtered_lines
+        checks = ['_matched']
+        if include_matched_descendants:
+            # Also include descendants of matched lines, if so requested.
+            checks.append("_is_descendant_of_matched")
+            for line in pslines:
+                line._is_descendant_of_matched = False
+            for line in pslines:
+                if line._is_descendant_of_matched:
+                    # Already scanned this one.  Don't recurse, otherwise
+                    # we'll hit O(N^2) behavior.
+                    continue
+                if not line._matched:
+                    continue
+                for cline in line._descendants:
+                    cline._is_descendant_of_matched = True
+        if include_matched_ancestors:
+            # Also include ancestors of matched lines, if so requested.
+            checks.append("_is_ancestor_of_matched")
+            for line in pslines:
+                line._is_ancestor_of_matched = False
+            for line in pslines:
+                if line._is_ancestor_of_matched:
+                    continue
+                if not line._matched:
+                    continue
+                for cline in line._ancestors:
+                    cline._is_ancestor_of_matched = True
+        filtered_lines = [
+            line for line in pslines
+            if any(getattr(line, c) for c in checks)]
+        return filtered_lines
+
+    def filter_remove_lines(self, pslines, remove_filters):
+        filtered_lines = pslines
+        for rmatcher in remove_filters:
+            filtered_lines = [line for line in filtered_lines
+                              if not rmatcher.match(line, store=False)]
+        return filtered_lines
+
+    def get_proc_ref_value(self, mapname, pid, column):
+        psmap = getattr(self, mapname)
+        psline = psmap[pid]
+        if isinstance(psline, list):
+            # self.procs could map to a list of pslines instead of just one,
+            # if --threads is used.  For now just use the first one.  TODO:
+            # improve this.
+            psline = psline[0]
+        value = psline[column]
+        if isinstance(value, MatchedStrList):
+            return list(map(str, value.mstrs))
+        s = str(value)
+        try:
+            return int(s)
+        except ValueError:
+            pass
+        try:
+            return float(s)
+        except ValueError:
+            pass
+        return s
+
+    def postprocess_instantiate_refvalues(self):
+        # Filters and matchers may contain references to other processes,
+        # e.g. "ancestors contains self.pid".  Instantiate these references
+        # with actual values.
+        for matcherexpr in self.opts.filter + self.opts.match + self.opts.remove:
+            for matcher in matcherexpr.all_matchers():
+                for fieldname in matcher.fieldnames:
+                    value = getattr(matcher, fieldname)
+                    if isinstance(value, ProcRefValue):
+                        value = self.get_proc_ref_value(
+                            value.procref.mapname,
+                            value.procref.pid,
+                            value.column)
+                        setattr(matcher, fieldname, value)
+
+
+    def postprocess_filter(self):
+        self.pslines = self.filter_remove_lines(self.pslines, self.opts.remove)
+
+        self.pslines = self.filter_lines(
+            self.pslines, self.opts.filter,
+            include_matched_descendants=self.opts.include_matched_descendants,
+            include_matched_ancestors=self.opts.include_matched_ancestors)
+
+        for matcher in self.opts.match:
+            for line in self.pslines:
+                matcher.match(line)
+
+    def compute_forest_relationships(self):
+        if not self.opts.forest: return
+
+        # Which pslines are remaining after filtering?
+        in_forest = set(psline.pid for psline in self.pslines)
+
+        # Find closest ancestors and adjust depths for nodes that have been
+        # orphaned by filtering.  (But we keep "gaps", which is why we bother
+        # computing depths before filtering.)
+        for psline in self.pslines:
+            if psline.root is psline: continue
+            # Find the closest ancestor in the subtree.
+            # print "## psline:", psline
+            missing_parents = 0
+            closest_ancestor = psline.parent
+            while closest_ancestor and closest_ancestor.pid not in in_forest:
+                # print "## ancestor not in subtree:", closest_ancestor
+                missing_parents += 1
+                closest_ancestor = closest_ancestor.parent
+            psline.missing_parents = missing_parents
+            psline.closest_ancestor = closest_ancestor
+
+            if not closest_ancestor:
+                # Orphan: Adjust depths of subtree.
+                def adjust_depth(node):
+                    node.depth -= missing_parents
+                    node.root = psline
+                    for child in node._children:
+                        adjust_depth(child)
+                old_rec_limit = sys.getrecursionlimit()
+                try:
+                    sys.setrecursionlimit(100000) # allow for huge depth
+                    adjust_depth(psline)
+                finally:
+                    sys.setrecursionlimit(old_rec_limit)
+
+        # Compute relationships.
+        for psline in self.pslines:
+            psline.relationships = [0] * psline.depth
+
+        for i, psline in enumerate(self.pslines):
+            if psline.root is psline: continue
+            pdepth = psline.depth - psline.missing_parents - 1
+            for depth in range(psline.depth - 1, pdepth, -1):
+                psline.relationships[depth] |= 4 # Missing parent
+            psline.relationships[pdepth] |= 1 # Parent
+            # Compute sibling relationships.
+            assert psline.closest_ancestor
+            for relative in reversed(self.pslines[0:i]):
+                if relative is psline.closest_ancestor:
+                    break
+                relative.relationships[pdepth] |= 2
+
+    def annotate_forest_relationships(self):
+        if not self.opts.forest: return
+        for psline in self.pslines:
+            prefix = ''
+            for rel in psline.relationships:
+                if rel == 0:
+                    prefix += "    "
+                elif rel & 1: # parent
+                    prefix += " \_ "
+                elif rel & 2: # siblings below
+                    prefix += " |  "
+                elif rel & 4: # missing ancestors
+                    prefix += " .. "
+                else:
+                    assert False, "internal error"
+            psline.forest_prefix = MatchedStr(prefix)
+
+
+    def _build_output(self, columns):
+        # Construct a list of lists of output data.
+        rows = []
+        if self.opts.header:
+            rows.append([MatchedStr(c.uname) for c in columns])
+        for line in self.pslines:
+            rows.append(
+                [line.get_mstr(
+                        column,
+                        forest=(self.opts.forest and i == len(columns)-1))
+                 for i, column in enumerate(columns)])
+        # Compute column widths.
+        max_widths = [max(len(c) for c in column)
+                      for column in zip(*rows)]
+        # Add "-----" header lines.
+        if self.opts.header:
+            rows.insert(1, [MatchedStr("-"*w) for w in max_widths])
+        return rows, max_widths
+
+
+    def _pretty_print(self, prefix, rows, columns, max_widths):
+        color = self.opts.color
+        for row in rows:
+            # Construct a single line, each column justified.
+            values = [justify(h, c, w)
+                      for h, c, w in zip(columns, row, max_widths)]
+            values[-1] = values[-1].rstrip()
+            line = MatchedStr(' ').join(values)
+            # Truncate to screen width.  Do this *before* colorizing.
+            if self.opts.screen_width:
+                line = line[:self.opts.screen_width]
+            print(prefix+line.colored(color))
+
+
+    def output(self, prefix=''):
+        columns = sorted(self.opts.columns)
+        rows, max_widths = self._build_output(columns)
+        self._pretty_print(prefix, rows, columns, max_widths)
+
+
+if __name__ == '__main__':
+    try:
+        XPS().main(sys.argv[1:])
+    except Exception as e:
+        print("%s: %s: %s" % (' '.join(sys.argv), type(e).__name__, e), file=sys.stderr)
+        raise

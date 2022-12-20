@@ -1,0 +1,509 @@
+#!/usr/bin/python2
+
+# pigs - show disk usage intelligently
+
+"""\
+Syntax: pigs [OPTION]... [PATH]...
+
+  -z          sort by size (default)
+  -n          sort by name
+  -d DEPTH    maximum depth; 0 for none (default: 3)
+  -s SIZE     minimum size (default: .01)
+                  - 0 for none
+                  - integer for absolute minimum size (default units 'KiB')
+                  - decimal for fraction of total
+  -m COUNT    maximum number; 0 for none
+                  (default: 20 if sorted by size, 0 if sorted by name)
+  -a          output automatic size (based on average) (default)
+  -A          output automatic size per item
+  -b          output in bytes
+  -H          choose SI units (powers of 10 instead of 2)
+  -k          output in KiB (1024) or kB (1000)
+  -M          output in MiB (1048576) or MB (1000000)
+  -G          output in GiB (1073741824) or GB (1000000000)
+  -i          count number of files instead of file size (approximation of inodes)
+"""
+
+# TODO: improve behavior for when directory is huge:
+#   - sort and prune incrementally, to avoid huge memory usage
+#   - display incrementally
+
+from __future__ import absolute_import, division, with_statement
+
+
+from   collections              import defaultdict
+import commands
+import getopt
+import os
+import re
+import stat
+import sys
+
+try:
+    os.path.realpath
+except AttributeError:
+    os.path.realpath = os.path.abspath
+
+def locate_du():
+    du = os.environ.get('Q__PROG_gdu')
+    if du:
+        return du, True
+    du = os.environ.get('Q__PROG_du')
+    if du:
+        return du, False
+    return 'du', (
+        os.popen('du --version 2>/dev/null').read().find('Free Software Foundation')!=-1)
+
+SIZE = 1
+NAME = 2
+class Options:
+    sort_by = SIZE
+    max_num = None
+    min_size = .01
+    max_depth = 3
+    targets = None
+    output_unit = 'a'
+    output_unit_si = False
+    output_unit_factor = 0
+    debug = False
+    mode = 'filesize'
+
+    du, du_is_gnu = locate_du()
+
+    def parse_args(self, args):
+        opts, arguments = getopt.getopt(args, 'znm:s:d:l:kaAkbMGHi',
+                                        ['version','versionx','help','debug'])
+        for option, value in opts:
+            if False:
+                pass
+            elif option == '--versionx':
+                print VERSION,
+                raise SystemExit
+            elif option == '--version':
+                print "Pigs %s"%VERSION
+                print VERSION_INFO
+                raise SystemExit
+            elif option == '--help':
+                print __doc__
+                raise SystemExit
+            elif option == '-a':
+                self.output_unit = 'a'
+            elif option == '-A':
+                self.output_unit = 'A'
+            elif option == '-k':
+                self.output_unit = 'k'
+            elif option == '-b':
+                self.output_unit = 'B'
+            elif option == '-M':
+                self.output_unit = 'M'
+            elif option == '-G':
+                self.output_unit = 'G'
+            elif option == '-H':
+                self.output_unit_si = True
+            elif option == '-z':
+                self.sort_by = SIZE
+            elif option == '-n':
+                self.sort_by = NAME
+            elif option == '-m':
+                self.max_num = int(value)
+            elif option == '-s':
+                self.min_size = str2size(value)
+            elif option == '-d' or option == '-l':
+                self.max_depth = int(value)
+            elif option == '-i':
+                self.mode = 'filecount'
+                self.output_unit = '#'
+            elif option == '--debug':
+                self.debug = True
+            else:
+                raise Exception("bad option %s"%option)
+        if not arguments: arguments = ['.']
+        self.targets = map(os.path.realpath, arguments)
+        if self.max_num is None:
+            if self.sort_by == SIZE:
+                self.max_num = 20
+            else:
+                self.max_num = 0
+
+    def figure_out_units(self, size):
+        ''' `unit` is 'B' for bytes or 'k', 'M', 'G' for mega/mebi bytes,
+        giga/gibi bytes, etc.
+
+        si picks between powers of 2 or 10.
+        '''
+        si = self.output_unit_si
+        if self.output_unit == '#':
+            self.output_unit_factor, self.output_unit = 1, ''
+        elif self.output_unit == 'A':
+            self.output_unit_factor, self.output_unit = 0,'A'
+        elif self.output_unit == 'a':
+            self.output_unit_factor, self.output_unit = self.auto_units(size)
+        elif self.output_unit == 'B':
+            self.output_unit_factor, self.output_unit = 1,'B'
+        elif self.output_unit == 'k':
+            if si: self.output_unit_factor, self.output_unit = 1000,'kB'
+            else:  self.output_unit_factor, self.output_unit = 1024,'KiB'
+        elif self.output_unit == 'M':
+            if si: self.output_unit_factor, self.output_unit = 1000000,'MB'
+            else:  self.output_unit_factor, self.output_unit = 1048576,'MiB'
+        elif self.output_unit == 'G':
+            if si: self.output_unit_factor, self.output_unit = 1000000000,'GB'
+            else:  self.output_unit_factor, self.output_unit = 1073741824,'GiB'
+        elif self.output_unit == 'T':
+            if si: self.output_unit_factor, self.output_unit = 1000000000000L,'TB'
+            else:  self.output_unit_factor, self.output_unit = 1099511627776L,'TiB'
+        else:
+            raise Exception, 'Internal error: invalid self.output_unit %s'%self.output_unit
+
+    def auto_units(self, size):
+        '''returns (number, label) based on size and options.output_unit_si'''
+        if self.output_unit_si:
+            if size < 1000:
+                return 1,'B'
+            if size < 1000000:
+                return 1000,'KB'
+            if size < 100000000:
+                return 1000000,'MB'
+            if size < 1000000000:
+                return 1000000000, 'GB'
+            return 100000000, 'TB'
+        else:
+            if size < 1024:
+                return 1,'B'
+            if size < 1048576:
+                return 1024,'KiB'
+            if size < 1073741824:
+                return 1048576,'MiB'
+            if size < 1099511627776L:
+                return 1073741824L,'GiB'
+            return 1099511627776L,'TiB'
+
+    def get_unit(self, number):
+        '''returns (factor, unit) as specified by user or determined
+        automatically'''
+        if self.output_unit == 'A':
+            return self.auto_units(number)
+        else:
+            return self.output_unit_factor, self.output_unit
+
+class Item(object):
+    __slots__ = ['path', 'size', 'split', 'percentage']
+
+    def __init__(self, path=None, size=None, split=None, percentage=None):
+        self.path       = path
+        self.size       = size
+        self.split      = split
+        self.percentage = percentage
+
+    def __cmp__(self, other):
+        if not isinstance(other, Item):
+            return NotImplemented
+        return cmp( (self.path, self.size, self.split, self.percentage),
+                    (other.path, other.size, other.split, other.percentage) )
+
+
+def str2size(s):
+    s = s.strip()
+    if s.startswith('.'):
+        return float(s)
+    m = re.match('([0-9]+)(.*)', s)
+    if not m:
+        raise SystemExit('invalid size string "%s"' %s)
+    num = long(m.group(1))
+    unit_str = m.group(2).strip().lower()
+    if not unit_str: unit_str = 'k'
+    if unit_str.startswith('b'):
+        return num * 1
+    elif unit_str.startswith('k'):
+        return num * 1024
+    elif unit_str.startswith('m'):
+        return num * 1024*1024
+    elif unit_str.startswith('g'):
+        return num * 1024*1024*1024
+    elif unit_str.startswith('t'):
+        return num * 1024*1024*1024*1024
+    raise Exception, 'Invalid size unit "%s"' %unit_str
+
+options = Options()
+
+def commify(number):
+    return commify_('%d'%number)
+
+def commify_(str):
+    if len(str) <= 3:
+        return str
+    return commify_(str[:-3]) + ',' + str[-3:]
+
+# >>> commify(1234567)
+# '1,234,567'
+
+def frac_commify(fraction):
+    n = long(fraction * 10)
+
+    return commify(n/10) + '.' + str(n%10)
+
+# >>> frac_commify(23456.78)
+# '23,456.8'
+
+def format_size(number):
+    factor, unit = options.get_unit(number)
+    if factor == 1:
+        return commify(number) + ' ' + unit
+    else:
+        return frac_commify( float(number)/float(factor) ) + ' ' + unit
+
+def path_classify(path):
+    if os.path.islink(path):
+        return '@'
+    if os.path.isdir(path):
+        return '/'
+    return ''
+
+class Pigs:
+
+    def hash_path_splits(self):
+        self.value = {}
+        for item in self.items:
+            self.value[tuple(item.split)] = item
+
+    def prune_max_items(self):
+        if options.max_num:
+            self.items[options.max_num:] = []
+
+    def sort_items_by_size(self):
+        '''Sort self.items by size.'''
+        def sortkey(item):
+            key = []
+            for counter in range(len(item.split)):
+                t = tuple(item.split[:counter+1])
+                if t in self.value:
+                    key.append((-self.value[t].size, item.split[counter]))
+            key.append(item.split)
+            return key
+        self.items.sort(key=sortkey)
+
+    def sort_items_by_name(self):
+        '''Sort self.items by name.'''
+        self.items.sort(key=lambda item: item.split)
+
+    def sort_items(self):
+        '''Sort self.items as specified by user'''
+        if options.sort_by == SIZE:
+            self.sort_items_by_size()
+        elif options.sort_by == NAME:
+            self.sort_items_by_name()
+        else:
+            assert(False and 'internal error - wrong sort type')
+
+    def clean_items(self):
+        # The basename is always written.  Intermediate directories
+        # normally print as `|', yet None is used to inhibit the line.
+        draw = []
+        for item in self.items:
+            split = item.split
+            while len(draw) > len(split) - 1:
+                del draw[-1]
+            while len(draw) < len(split) - 1:
+                draw.append(0)
+            draw.append(1)
+            for counter in range(len(split) - 1):
+                if not draw[counter]:
+                    split[counter] = None
+
+    def get_data_for_file_size(self):
+        '''Set self.items and self.total from `du` pipe'''
+        du_args = [options.du, ' -a']
+        if options.du_is_gnu:
+            # Use block size of 1 byte.  We use the longform option
+            # '--block-size=1' rather than -b.  (In fileutils 4.x, `-b' was
+            # equivalent to --block-size=1, but in coreutils 5.x, `-b' now
+            # means `--apparent-size --block-size=1'.)
+            du_args += ' --block-size=1'
+            if self.want_total:
+                du_args += ' -c'
+            du_unit = 1
+        else:
+            # POSIX says du output block size should be 512, but some versions
+            # of `du' violate POSIX and default to 1024.  We use the '-k'
+            # option to make sure we know what we're getting.  (We used to use
+            # du_unit=512, os.environ['POSIXLY_CORRECT']=1.  That works for
+            # GNU du but not BSD du.)
+            du_args += ' -k'
+            du_unit = 1024
+        cmd = ''.join(du_args + map(commands.mkarg, options.targets))
+        pipe = os.popen(cmd)
+        self.raw_items = []
+        n_target = 0
+        prevline = None
+        for line in pipe:
+            if options.debug:
+                print >>sys.stderr, '##', repr(line)
+            try:
+                text, path = line.split('\t', 1)
+                size = long(text) * du_unit
+                if path.endswith('\n'):
+                    path = path[:-1]
+            except Exception, e:
+                # raise SystemExit("%s: Couldn't parse `du' output line: '%s' [%s]"%(sys.argv[0],line,e))
+                print >>sys.stderr, "%s: Couldn't parse `du' output line: %s [%s]"%(sys.argv[0],repr(line),e)
+                continue
+            self.raw_items.append(Item(path=path, size=size))
+        status = pipe.close()
+        if status:
+            # raise SystemExit("du subprocess exited with error code %s" %os.WEXITSTATUS(status))
+            print >>sys.stderr, 'pigs: du subprocess exited with error code %s'%os.WEXITSTATUS(status)
+        if not self.raw_items:
+            raise SystemExit("No files to show")
+        if self.want_total:
+            if options.du_is_gnu and self.raw_items and self.raw_items[-1].path == 'total':
+                # GNU du's "-c" option prints the total as the last item.
+                self.total = self.raw_items.pop().size
+            else:
+                # Manually sum the totals by invoking du again.  Shouldn't be
+                # too big a waste since du caches well.
+                du_args += ' -s'
+                cmd = ''.join(du_args + map(commands.mkarg, options.targets))
+                self.total = 0
+                try:
+                    for line in os.popen(cmd):
+                        text, path = line.split('\t', 1)
+                        size = long(text) * du_unit
+                        self.total += size
+                except:
+                    print >>sys.stderr, "pigs: warning: couldn't get total size"
+        else:
+            assert(self.raw_items)
+            self.total = self.raw_items[-1].size
+
+    def get_data_for_file_count(self):
+        filecounts = defaultdict(lambda: 0)
+        def walk(path):
+            c = 1
+            try:
+                st = os.lstat(path)
+            except OSError as e:
+                print >>sys.stderr, "pigs: warning: not counting children of %s because of lstat error: %s" % (path, e)
+            else:
+                islink = stat.S_ISLNK(st.st_mode)
+                isdir  = stat.S_ISDIR(st.st_mode)
+                if isdir and not islink:
+                    try:
+                        children = os.listdir(path)
+                    except OSError as e:
+                        print >>sys.stderr, "pigs: warning: not counting children of %s because of listdir error: %s" % (path, e)
+                    else:
+                        for child in children:
+                            c += walk(os.path.join(path, child))
+            filecounts[path] = c
+            return c
+        self.total = 0
+        for path in options.targets:
+            self.total += walk(path)
+        # Construct a list of C{Item}s.  For now the order doesn't matter as
+        # this will be sorted later.
+        self.raw_items = [Item(path=path, size=size)
+                          for path, size in filecounts.items()]
+
+    def compute_item_splits(self):
+        n_target = 0
+        self.items = []
+        for item in self.raw_items:
+            if n_target < len(options.targets)-1 and item.path.startswith(options.targets[n_target+1]):
+                n_target += 1
+            t = os.path.join(options.targets[n_target],'')
+            if item.path.startswith(t):
+                split = [t[:-1]] + item.path[len(t):].split(os.sep)
+            elif os.path.join(item.path,'') == t:
+                split = [t[:-1]]
+            else:
+                split = item.path.split(os.sep)
+            depth = len(split)
+            if options.max_depth and depth > options.max_depth:
+                continue
+            item = Item(path=item.path, size=item.size, split=split)
+            self.items.append(item)
+
+    def calculate_bounds(self):
+        '''Set self.max_size, self.min_size, self.average_size'''
+        assert(self.items)
+        total = max_size = min_size = self.items[0].size
+        for item in self.items[1:]:
+            max_size = max(max_size, item.size)
+            min_size = min(min_size, item.size)
+            total += item.size
+        self.max_size, self.min_size = max_size, min_size
+        self.average_size = float(total) / len(self.items)
+
+    def filter_above_min_size(self):
+        '''Keep only those items of self.items > options.min_size'''
+        if options.min_size:
+            self.items = [item for item in self.items if item.size > options.min_size]
+            if not self.items:
+                raise SystemExit("No files to show")
+
+    def calculate_percentages(self):
+        '''Set item.percentage for each item'''
+        # hash_path_splits() must have been called
+        for item in self.items:
+            par_item = self.value.get(tuple(item.split[:-1]))
+            par_size = par_item and par_item.size or (self.want_total or None) and self.total
+            item.percentage = par_size and (float(item.size) / par_size)
+
+    def display(self):
+        # Erase unneeded fragments of vertical lines.
+        self.clean_items()
+        self.items.reverse()
+        self.clean_items()
+        self.items.reverse()
+        # Erase leftmost white columns.
+        skip = 0
+        split = self.items[0].split
+        while not split[skip]:
+            skip = skip + 1
+        # Display.
+        if self.want_total:
+            print "Total:", format_size(self.total)
+            print
+        size_length = len(format_size(self.max_size))
+        for item in self.items:
+            assert(item)
+            sys.stdout.write(format_size(item.size).rjust(size_length))
+            sys.stdout.write(' ')
+            for component in item.split[skip:-1]:
+                if component:
+                    sys.stdout.write('|  ')
+                else:
+                    sys.stdout.write('   ')
+            sys.stdout.write('\\_')
+            if item.percentage is not None:
+                sys.stdout.write('%3.f%%' % (item.percentage*100.0))
+            sys.stdout.write(' %s%s\n' % (item.split[-1], path_classify(item.path)))
+
+    def run(self):
+        self.want_total = len(options.targets) > 1
+        if options.mode == 'filesize':
+            self.get_data_for_file_size()
+        elif options.mode == 'filecount':
+            self.get_data_for_file_count()
+        else:
+            raise AssertionError
+        if isinstance(options.min_size, float):
+            options.min_size *= self.total
+        self.compute_item_splits()
+        self.filter_above_min_size()
+        self.calculate_bounds()
+        options.figure_out_units(self.average_size)
+        self.hash_path_splits()
+        self.sort_items()
+        self.prune_max_items()
+        self.calculate_percentages()
+        self.display()
+
+if __name__ == '__main__':
+    try:
+        options.parse_args(sys.argv[1:])
+    except SystemExit, e:
+        raise SystemExit
+    except Exception, e:
+        raise SystemExit(str(e) + '\n\n' + __doc__)
+    Pigs().run()
